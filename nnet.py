@@ -5,6 +5,8 @@ import numpy as np
 from skfusion import fusion
 import load_cifar
 import load_mnist
+from sklearn.metrics import roc_auc_score as auc
+import roc_auc as auc
 
 
 srng = RandomStreams()
@@ -48,27 +50,6 @@ def dropout(X, p=0.):
     return X
 
 
-def fusion_update(w_h, w_h2, w_o, rank, threshold=0.2):
-    t1 = fusion.ObjectType('Type 1', rank)
-    t2 = fusion.ObjectType('Type 2', rank)
-    t3 = fusion.ObjectType('Type 3', rank)
-    t4 = fusion.ObjectType('Type 4', rank)
-    relations = [fusion.Relation(w_h.get_value(), t1, t2),
-                 fusion.Relation(w_h2.get_value(), t2, t3),
-                 fusion.Relation(w_o.get_value(), t3, t4)]
-    fusion_graph = fusion.FusionGraph()
-    fusion_graph.add_relations_from(relations)
-    fuser = fusion.Dfmf()
-    fuser.fuse(fusion_graph)
-    c1 = (abs(fuser.complete(relations[0])) - (abs(w_h.get_value()))) < threshold
-    c2 = (abs(fuser.complete(relations[1])) - (abs(w_h2.get_value()))) < threshold
-    c3 = (abs(fuser.complete(relations[2])) - (abs(w_o.get_value()))) < threshold
-    w_h *= c1
-    w_h2 *= c2
-    w_o *= c3
-    return w_h, w_h2, w_o, c1, c2, c3
-
-
 def model(X, w_h, w_h2, w_o, p_drop_input, p_drop_hidden):
     X = dropout(X, p_drop_input)
     h = rectify(T.dot(X, w_h))
@@ -78,22 +59,6 @@ def model(X, w_h, w_h2, w_o, p_drop_input, p_drop_hidden):
 
     h2 = dropout(h2, p_drop_hidden)
     py_x = softmax(T.dot(h2, w_o))
-    return h, h2, py_x
-
-
-def model_f(X, w_h, w_h2, w_o, rank):
-    w_h_mf, w_h2_mf, w_o_mf, c1, c2, c3 = fusion_update(w_h, w_h2, w_o, rank, 0.2)
-
-    h = rectify(T.dot(X, w_h_mf))
-    h2 = rectify(T.dot(h, w_h2_mf))
-    py_x = softmax(T.dot(h2, w_o_mf))
-    return h, h2, py_x, c1, c2, c3
-
-
-def model_after(X, w_h, w_h2, w_o, c1, c2, c3):
-    h = rectify(T.dot(X, w_h*c1))
-    h2 = rectify(T.dot(h, w_h2*c2))
-    py_x = softmax(T.dot(h2, w_o*c3))
     return h, h2, py_x
 
 
@@ -114,32 +79,22 @@ w_o = init_weights((hidden, num_of_class)) # 10 <- output
 
 noise_h, noise_h2, noise_py_x = model(X, w_h, w_h2, w_o, 0.2, 0.5)
 h, h2, py_x = model(X, w_h, w_h2, w_o, 0., 0.)
-h_mf, h2_mf, py_x_mf, c1, c2, c3 = model_f(X, w_h, w_h2, w_o, rank)
-h_a, h2_a, py_x_a = model_after(X, w_h, w_h2, w_o, c1, c2, c3)
 y_x = T.argmax(py_x, axis=1)
 
 cost = T.mean(T.nnet.categorical_crossentropy(noise_py_x, Y))
-cost_mf = T.mean(T.nnet.categorical_crossentropy(py_x_mf, Y))
-cost_a = T.mean(T.nnet.categorical_crossentropy(py_x_a, Y))
 params = [w_h, w_h2, w_o]
 updates = RMSprop(cost, params, lr=0.001)
-updates_mf = RMSprop(cost_mf, params, lr=0.001)
-updates_a = RMSprop(cost_a, params, lr=0.001)
 
 train = theano.function(inputs=[X, Y], outputs=cost, updates=updates, allow_input_downcast=True)
-train_mf = theano.function(inputs=[X, Y], outputs=cost_mf, updates=updates_mf, allow_input_downcast=True)
-train_after = theano.function(inputs=[X, Y], outputs=cost_a, updates=updates_a, allow_input_downcast=True)
 predict = theano.function(inputs=[X], outputs=y_x, allow_input_downcast=True)
 
 
-for i in range(50):
+for i in range(60):
     for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)): # 0,128; 128,256; ...
         cost = train(trX[start:end], trY[start:end])
+    y_score = predict(teX)
     print np.mean(np.argmax(teY, axis=1) == predict(teX))
-for i in range(10):
-    for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
-        cost = train_mf(trX[start:end], trY[start:end])
-        cost = train_after(trX[start:end], trY[start:end])
-    print "MF:", np.mean(np.argmax(teY, axis=1) == predict(teX))
+    print "AUC:", auc.roc_auc(np.argmax(teY, axis=1), y_score)
+
 #MF
 #print
