@@ -5,10 +5,11 @@ import numpy as np
 from theano.tensor.nnet.conv import conv2d
 from theano.tensor.signal.downsample import max_pool_2d
 import load_mnist
-# from skfusion import fusion
 from ionmf.factorization.onmf import onmf
 import roc_auc as auc
 import time
+import pandas as pd
+
 
 srng = RandomStreams()
 
@@ -38,71 +39,70 @@ def dropout(X, p=0.):
     return X
 
 
+# def fusion_update(weight_matrix, rank):
+#     weights = weight_matrix.get_value()
+#     (n_kernels, n_channels, w, h) = weights.shape
+#     C = np.zeros((n_kernels, n_channels, w, h))
+#     deg = []
+#     for i in range(n_kernels):
+#         d = 0
+#         for j in range(n_channels):
+#             W, H = onmf(weights[i, j], rank=rank, alpha=1.0)
+#             A = W.dot(H)
+#             threshold = np.mean(np.percentile(abs(A) - abs(weights[i, j]), 20))
+#             c = (abs(A) - (abs(weights[i, j]))) < threshold
+#             weights[i, j] *= c
+#             C[i, j] = c
+#             d += 1 - (np.count_nonzero(c) / len(c.flat))
+#         deg.append(np.mean(d))
+#     deg = np.mean(deg)
+#     weight_matrix.set_value(weights)
+#     return deg, C
+
+
+# def repair(weight_matrix, c):
+#     (n_kernels, n_channels, w, h) = c.shape
+#     weights = weight_matrix.get_value()
+#     for i in range(n_kernels):
+#         for j in range(n_channels):
+#             weights[i, j] *= c[i, j]
+#     weight_matrix.set_value(weights)
+
 def fusion_update(weight_matrix, rank):
-    # define our data fusion graph
-    # filtre sestevamo (po celicah v mrezi)
-    # na diagonalo postavimo posamezne filtre
-    # v preostale koordinate (recimo na i, j)
-    #  bi postavili vsoto filtra i in filtra j
-    #   0  1    2     3     4
-    # 0    w0   w0+w1 w0+w2 w0+w3
-    # 1         w1    w1+w2 w1+w3
-    # 2               w2    w2+w3
-    # 3                     w3
-    # 4
     weights = weight_matrix.get_value()
-    # print(weights.shape)
     (n_kernels, n_channels, w, h) = weights.shape
-    C = np.zeros((n_kernels, n_channels, w, h))
     deg = []
+    C = []
     for i in range(n_kernels):
-        d = 0
-        for j in range(n_channels):
-            W, H = onmf(weights[i, j], rank=rank, alpha=1.0)
-            A = W.dot(H)
-            # print(W.shape, H.shape, weights[i, j].shape, C.shape, w, h)
-            threshold = np.mean(np.percentile(abs(A) - abs(weights[i, j]), 20))
-            c = (abs(A) - (abs(weights[i, j]))) < threshold
-            weights[i, j] *= c
-            C[i, j] = c
-            d += 1 - (np.count_nonzero(c) / len(c.flat))
+        channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
+        channels = np.hstack(np.asarray(channels))
+        W, H = onmf(channels, rank=rank, alpha=1.0)
+        A = W.dot(H)
+        diff = abs(A) - abs(channels)
+        threshold = np.mean(np.percentile(diff, 20))
+        c = diff < threshold
+        channels *= c
+        C.append(c)
+        d = 1 - (np.count_nonzero(c) / len(c.flat))
         deg.append(np.mean(d))
+        vector_w = np.hsplit(channels, n_channels)
+        for j in range(n_channels):
+            weights[i, j] = vector_w[j].reshape(w, h)
     deg = np.mean(deg)
     weight_matrix.set_value(weights)
     return deg, C
-    # t = [fusion.ObjectType('kernel_'+str(b), rank) for b in range(0, len(weights)+1)]
-    # relations = []
-    # indexes = []
-    # indexes2 = []
-    # for i in range(0, len(weights)):
-    #     for j in range(0, len(weights)):
-    #         if i == j:
-    #             indexes.append(len(relations))
-    #             indexes2.append(i)
-    #             relations.append(fusion.Relation(weights[i], t[i], t[j+1]))
-    #         elif i > j:
-    #             relations.append(fusion.Relation(weights[i]+weights[j], t[i], t[j+1]))
-    #
-    # fusion_graph = fusion.FusionGraph()
-    # fusion_graph.add_relations_from(relations)
-    # # infer the latent data model
-    # fuser = fusion.Dfmf()
-    # fuser.fuse(fusion_graph)
-    # c = np.zeros(len(weights))
-    # print indexes
-    # threshold = np.mean(np.percentile(abs(fuser.complete(relations)) - abs(w.get_value()), 20))
-    # for k, idx in enumerate(indexes):
-    #     c[k] = (abs(fuser.complete(relations[idx])) - (abs(w.get_value()[a, indexes2[i]]))) < threshold
-    #     w[i, k] *= c[k]
-    # all_c.append(c)
 
 
-def repair(weight_matrix, c):
-    (n_kernels, n_channels, w, h) = c.shape
+def repair(weight_matrix, C):
     weights = weight_matrix.get_value()
+    (n_kernels, n_channels, w, h) = weights.shape
     for i in range(n_kernels):
+        channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
+        channels = np.hstack(np.asarray(channels))
+        channels *= C[i]
+        vector_w = np.hsplit(channels, n_channels)
         for j in range(n_channels):
-            weights[i, j] *= c[i, j]
+            weights[i, j] = vector_w[j].reshape(w, h)
     weight_matrix.set_value(weights)
 
 
@@ -168,13 +168,19 @@ updates = RMSprop(cost, params, lr=0.001)
 train = theano.function(inputs=[X, Y], outputs=cost, updates=updates, allow_input_downcast=True)
 predict = theano.function(inputs=[X], outputs=y_x, allow_input_downcast=True)
 
-for i in range(15):
+AUC = []
+TIME = []
+for i in range(30):
     for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
         cost = train(trX[start:end], trY[start:end])
     start = time.time()
     y_score = predict(teX)
     end = time.time()-start
-    print("AUC:", auc.roc_auc(np.argmax(teY, axis=1), y_score), "TIME:", end)
+    auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
+    TIME.append(end)
+    AUC.append(auc_r)
+    print("AUC:", auc_r, "TIME:", end)
+
 C = []
 deg = []
 for p in params2:
@@ -184,8 +190,12 @@ for p in params2:
 start = time.time()
 y_score = predict(teX)
 end = time.time()-start
-print("MF AUC:", auc.roc_auc(np.argmax(teY, axis=1), y_score), "deg:", np.mean(deg), "TIME:", end)  # , "thresh:", np.mean(thresh)
-for i in range(8):
+auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
+TIME.append(end)
+AUC.append(auc_r)
+print("MF AUC:", auc_r, "deg:", np.mean(deg), "TIME:", end)  # , "thresh:", np.mean(thresh)
+
+for i in range(20):
     for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
         cost = train(trX[start:end], trY[start:end])
         for j in range(len(params2)):
@@ -193,4 +203,11 @@ for i in range(8):
     start = time.time()
     y_score = predict(teX)
     end = time.time()-start
-    print("AUC:", auc.roc_auc(np.argmax(teY, axis=1), y_score), "TIME:", end)
+    auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
+    TIME.append(end)
+    AUC.append(auc_r)
+    print("AUC:", auc_r, "TIME:", end)
+
+data = pd.DataFrame({"AUC": AUC, "TIME": TIME})
+data.to_csv("cnnet_fusion_stacked.csv", index=False)
+
