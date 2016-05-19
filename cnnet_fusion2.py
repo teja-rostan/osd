@@ -42,43 +42,34 @@ def dropout(X, p=0.):
 def fusion_update(weight_matrix, rank):
     weights = weight_matrix.get_value()
     (n_kernels, n_channels, w, h) = weights.shape
+    C = np.zeros((n_kernels, n_channels, w, h))
     deg = 0
-    c = []
     for i in range(n_kernels):
-        channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
-        channels = np.hstack(np.asarray(channels))
-        channels, c, deg = prune(channels, c, rank, deg)
-        vector_w = np.hsplit(channels, n_channels)
-        for j in range(n_channels):
-            weights[i, j] = vector_w[j].reshape(w, h)
+        weights, C, deg = prune(i, n_channels, weights, C, rank, deg)
     weight_matrix.set_value(weights)
-    return deg, c
+    return deg, C
 
 
 def repair(weight_matrix, c):
+    (n_kernels, n_channels, w, h) = c.shape
     weights = weight_matrix.get_value()
-    (n_kernels, n_channels, w, h) = weights.shape
     for i in range(n_kernels):
-        channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
-        channels = np.hstack(np.asarray(channels))
-        channels *= c[i]
-        vector_w = np.hsplit(channels, n_channels)
         for j in range(n_channels):
-            weights[i, j] = vector_w[j].reshape(w, h)
+            weights[i, j] *= c[i, j]
     weight_matrix.set_value(weights)
 
 
-def prune(channels, C, rank, deg):
-    W, H = onmf(channels, rank=rank, alpha=1.0)
-    A = W.dot(H)
-    diff = abs(A) - abs(channels)
-    threshold = np.mean(np.percentile(diff, 30))
-    c = diff < threshold
-    c = c * channels != 0
-    channels *= c
-    C.append(c)
-    deg += (c.size - np.count_nonzero(c))
-    return channels, C, deg
+def prune(i, n_channels, weights, C, rank, deg):
+    for j in range(n_channels):
+        W, H = onmf(weights[i, j], rank=rank, alpha=1.0)
+        A = W.dot(H)
+        diff = abs(A) - abs(weights[i, j])
+        threshold = np.mean(np.percentile(diff, 30))
+        c =  diff < threshold
+        weights[i, j] *= c
+        C[i, j] = c
+        deg += (c.size - np.count_nonzero(c))
+    return weights, C, deg
 
 
 def degree(deg, params2):
@@ -113,7 +104,7 @@ def prune_network(teX, teY, params2):
         C.append(c)
         deg += d
     deg_norm = degree(deg, params2)
-    print("deg:", deg_norm)
+    print("deg:", deg_norm)  # , "thresh:", np.mean(thresh)
     return C, deg_norm
 
 
@@ -146,7 +137,7 @@ def predict_cnn(teX, teY):
     start = timer()
     y_score = predict(teX)
     end = timer()
-    end = end-start
+    end = end - start
     auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
     return end, auc_r
 
@@ -234,4 +225,4 @@ while n_iteration > 0:
 
 
 data = pd.DataFrame({"AUC": AUC, "TIME": TIME/reference_time, "DEG": deg_norm, "reference": reference_time})
-data.to_csv("cnnet_fusion_jointed_mp.csv", index=False)
+data.to_csv("cnnet_fusion_separated_mp.csv", index=False)

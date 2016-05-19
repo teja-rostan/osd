@@ -4,12 +4,11 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 import numpy as np
 from theano.tensor.nnet.conv import conv2d
 from theano.tensor.signal.downsample import max_pool_2d
-import load_mnist
+import load_cifar
 from ionmf.factorization.onmf import onmf
 import roc_auc as auc
 from timeit import default_timer as timer
 import pandas as pd
-
 
 srng = RandomStreams()
 
@@ -42,43 +41,34 @@ def dropout(X, p=0.):
 def fusion_update(weight_matrix, rank):
     weights = weight_matrix.get_value()
     (n_kernels, n_channels, w, h) = weights.shape
+    C = np.zeros((n_kernels, n_channels, w, h))
     deg = 0
-    c = []
     for i in range(n_kernels):
-        channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
-        channels = np.hstack(np.asarray(channels))
-        channels, c, deg = prune(channels, c, rank, deg)
-        vector_w = np.hsplit(channels, n_channels)
-        for j in range(n_channels):
-            weights[i, j] = vector_w[j].reshape(w, h)
+        weights, C, deg = prune(i, n_channels, weights, C, rank, deg)
     weight_matrix.set_value(weights)
-    return deg, c
+    return deg, C
 
 
 def repair(weight_matrix, c):
+    (n_kernels, n_channels, w, h) = c.shape
     weights = weight_matrix.get_value()
-    (n_kernels, n_channels, w, h) = weights.shape
     for i in range(n_kernels):
-        channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
-        channels = np.hstack(np.asarray(channels))
-        channels *= c[i]
-        vector_w = np.hsplit(channels, n_channels)
         for j in range(n_channels):
-            weights[i, j] = vector_w[j].reshape(w, h)
+            weights[i, j] *= c[i, j]
     weight_matrix.set_value(weights)
 
 
-def prune(channels, C, rank, deg):
-    W, H = onmf(channels, rank=rank, alpha=1.0)
-    A = W.dot(H)
-    diff = abs(A) - abs(channels)
-    threshold = np.mean(np.percentile(diff, 30))
-    c = diff < threshold
-    c = c * channels != 0
-    channels *= c
-    C.append(c)
-    deg += (c.size - np.count_nonzero(c))
-    return channels, C, deg
+def prune(i, n_channels, weights, C, rank, deg):
+    for j in range(n_channels):
+        W, H = onmf(weights[i, j], rank=rank, alpha=1.0)
+        A = W.dot(H)
+        diff = abs(A) - abs(weights[i, j])
+        threshold = np.mean(np.percentile(diff, 30))
+        c =  diff < threshold
+        weights[i, j] *= c
+        C[i, j] = c
+        deg += (c.size - np.count_nonzero(c))
+    return weights, C, deg
 
 
 def degree(deg, params2):
@@ -113,7 +103,7 @@ def prune_network(teX, teY, params2):
         C.append(c)
         deg += d
     deg_norm = degree(deg, params2)
-    print("deg:", deg_norm)
+    print("deg:", deg_norm)  # , "thresh:", np.mean(thresh)
     return C, deg_norm
 
 
@@ -146,7 +136,7 @@ def predict_cnn(teX, teY):
     start = timer()
     y_score = predict(teX)
     end = timer()
-    end = end-start
+    end = end - start
     auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
     return end, auc_r
 
@@ -186,18 +176,16 @@ def model(X, w, w2, w3, w4, p_drop_conv, p_drop_hidden):
     return l1, l2, l3, l4, pyx
 
 
-(trX, trY), (teX, teY), num_of_class = load_mnist.load_data()
+(trX, trY), (teX, teY), num_of_class = load_cifar.load_data()
 
-trX = trX.reshape(-1, 1, 28, 28)
-teX = teX.reshape(-1, 1, 28, 28)
 
 X = T.ftensor4()
 Y = T.fmatrix()
 
-w = init_weights((32, 1, 5, 5))  # conv weights (n_kernels, n_channels, kernel_w, kernel_h)
+w = init_weights((32, 3, 5, 5))  # conv weights (n_kernels, n_channels, kernel_w, kernel_h)
 w2 = init_weights((64, 32, 5, 5))
 w3 = init_weights((128, 64, 5, 5))
-w4 = init_weights((128 * 1 * 1, 625))  # highest conv layer has 128 filters and a 3x3 grid of responses
+w4 = init_weights((128 * 2 * 2, 625))  # highest conv layer has 128 filters and a 3x3 grid of responses
 w_o = init_weights((625, 10))
 
 noise_l1, noise_l2, noise_l3, noise_l4, noise_py_x = model(X, w, w2, w3, w4, 0.2, 0.5)
@@ -213,11 +201,11 @@ updates = RMSprop(cost, params, lr=0.001)
 train = theano.function(inputs=[X, Y], outputs=cost, updates=updates, allow_input_downcast=True)
 predict = theano.function(inputs=[X], outputs=y_x, allow_input_downcast=True)
 
+
 AUC = []
 auc_list = []
 TIME = []
 n_iteration = 4
-
 while not converged(5, auc_list):
     TIME, AUC, auc_list = learn_network(1, teX, teY, TIME, AUC, auc_list)
 reference_time = np.max(TIME)
@@ -234,4 +222,4 @@ while n_iteration > 0:
 
 
 data = pd.DataFrame({"AUC": AUC, "TIME": TIME/reference_time, "DEG": deg_norm, "reference": reference_time})
-data.to_csv("cnnet_fusion_jointed_mp.csv", index=False)
+data.to_csv("cnnet_fusion_cifar_separated_mp.csv", index=False)

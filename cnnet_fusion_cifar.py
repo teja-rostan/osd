@@ -7,7 +7,7 @@ from theano.tensor.signal.downsample import max_pool_2d
 import load_cifar
 from ionmf.factorization.onmf import onmf
 import roc_auc as auc
-import time
+from timeit import default_timer as timer
 import pandas as pd
 
 srng = RandomStreams()
@@ -38,72 +38,115 @@ def dropout(X, p=0.):
     return X
 
 
-# def fusion_update(weight_matrix, rank):
-#     weights = weight_matrix.get_value()
-#     (n_kernels, n_channels, w, h) = weights.shape
-#     C = np.zeros((n_kernels, n_channels, w, h))
-#     deg = []
-#     for i in range(n_kernels):
-#         d = 0
-#         for j in range(n_channels):
-#             W, H = onmf(weights[i, j], rank=rank, alpha=1.0)
-#             A = W.dot(H)
-#             threshold = np.mean(np.percentile(abs(A) - abs(weights[i, j]), 20))
-#             c = (abs(A) - (abs(weights[i, j]))) < threshold
-#             weights[i, j] *= c
-#             C[i, j] = c
-#             d += 1 - (np.count_nonzero(c) / len(c.flat))
-#         deg.append(np.mean(d))
-#     deg = np.mean(deg)
-#     weight_matrix.set_value(weights)
-#     return deg, C
-
-
-# def repair(weight_matrix, c):
-#     (n_kernels, n_channels, w, h) = c.shape
-#     weights = weight_matrix.get_value()
-#     for i in range(n_kernels):
-#         for j in range(n_channels):
-#             weights[i, j] *= c[i, j]
-#     weight_matrix.set_value(weights)
-#
-
 def fusion_update(weight_matrix, rank):
     weights = weight_matrix.get_value()
     (n_kernels, n_channels, w, h) = weights.shape
-    deg = []
+    deg = 0
     C = []
     for i in range(n_kernels):
         channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
         channels = np.hstack(np.asarray(channels))
-        W, H = onmf(channels, rank=rank, alpha=1.0)
-        A = W.dot(H)
-        diff = abs(A) - abs(channels)
-        threshold = np.mean(np.percentile(diff, 20))
-        c = diff < threshold
-        channels *= c
-        C.append(c)
-        d = 1 - (np.count_nonzero(c) / len(c.flat))
-        deg.append(np.mean(d))
+        channels, C, deg = prune(channels, C, rank, deg)
         vector_w = np.hsplit(channels, n_channels)
         for j in range(n_channels):
             weights[i, j] = vector_w[j].reshape(w, h)
-    deg = np.mean(deg)
     weight_matrix.set_value(weights)
     return deg, C
 
 
-def repair(weight_matrix, C):
+def repair(weight_matrix, c):
     weights = weight_matrix.get_value()
     (n_kernels, n_channels, w, h) = weights.shape
     for i in range(n_kernels):
         channels = [np.asarray(weights[i, j]).reshape(w*h, 1) for j in range(n_channels)]
         channels = np.hstack(np.asarray(channels))
-        channels *= C[i]
+        channels *= c[i]
         vector_w = np.hsplit(channels, n_channels)
         for j in range(n_channels):
             weights[i, j] = vector_w[j].reshape(w, h)
     weight_matrix.set_value(weights)
+
+
+def prune(channels, C, rank, deg):
+    W, H = onmf(channels, rank=rank, alpha=1.0)
+    A = W.dot(H)
+    diff = abs(A) - abs(channels)
+    threshold = np.mean(np.percentile(diff, 30))
+    c = diff < threshold
+    channels *= c
+    C.append(c)
+    deg += (c.size - np.count_nonzero(c))
+    return channels, C, deg
+
+
+def degree(deg, params2):
+    return deg / network_size(params2)
+
+
+def network_size(params2):
+    size = 0
+    for p in params2:
+        w = p.get_value()
+        size += w.size
+    return size
+
+
+def learn_network(n_iterations, teX, teY, TIME, AUC, auc_list):
+    for i in range(n_iterations):
+        for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
+            train(trX[start:end], trY[start:end])
+        end, auc_r = predict_cnn(teX, teY)
+        TIME.append(end)
+        AUC.append(auc_r)
+        auc_list.append(auc_r)
+        print("AUC:", auc_r, "TIME:", end)
+    return TIME, AUC, auc_list
+
+
+def prune_network(teX, teY, params2):
+    C = []
+    deg = 0
+    for p in params2:
+        d, c = fusion_update(p, 5)
+        C.append(c)
+        deg += d
+    deg_norm = degree(deg, params2)
+    print("deg:", deg_norm)  # , "thresh:", np.mean(thresh)
+    return C, deg_norm
+
+
+def tuning_network(n_iterations, C, teX, teY, params2, AUC, TIME):
+    for i in range(n_iterations):
+        for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
+            train(trX[start:end], trY[start:end])
+            for j in range(len(params2)):
+                repair(params2[j], C[j])
+        end, auc_r = predict_cnn(teX, teY)
+        TIME.append(end)
+        AUC.append(auc_r)
+        auc_list.append(auc_r)
+        print("AUC:", auc_r, "TIME:", end)
+    return TIME, AUC, auc_list
+
+
+def converged(iteration, auc_list):
+    if len(auc_list) > iteration:
+        last = auc_list[-iteration]
+        if np.max(auc_list[-iteration+1:]) > last + 1e-5:
+            return False
+        else:
+            return True
+    return False
+
+
+def predict_cnn(teX, teY):
+    _, _, h, w = teX.shape
+    start = timer()
+    y_score = predict(teX)
+    end = timer()
+    end = end - start
+    auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
+    return end, auc_r
 
 
 def RMSprop(cost, params, lr=0.001, rho=0.9, epsilon=1e-6):
@@ -166,45 +209,26 @@ updates = RMSprop(cost, params, lr=0.001)
 train = theano.function(inputs=[X, Y], outputs=cost, updates=updates, allow_input_downcast=True)
 predict = theano.function(inputs=[X], outputs=y_x, allow_input_downcast=True)
 
+
 AUC = []
+auc_list = []
 TIME = []
-for i in range(30):
-    for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
-        cost = train(trX[start:end], trY[start:end])
-    start = time.time()
-    y_score = predict(teX)
-    end = time.time()-start
-    auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
-    TIME.append(end)
-    AUC.append(auc_r)
-    print("AUC:", auc_r, "TIME:", end)
+n_iteration = 4
 
-C = []
-deg = []
-for p in params2:
-    d, c = fusion_update(p, 5)
-    C.append(c)
-    deg.append(d)
-start = time.time()
-y_score = predict(teX)
-end = time.time()-start
-auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
-TIME.append(end)
-AUC.append(auc_r)
-print("MF AUC:", auc_r, "deg:", np.mean(deg), "TIME:", end)  # , "thresh:", np.mean(thresh)
+while not converged(5, auc_list):
+    TIME, AUC, auc_list = learn_network(1, teX, teY, TIME, AUC, auc_list)
+reference_time = np.max(TIME)
+C, deg_norm = prune_network(teX, teY, params2)
+auc_list[:] = []
+while n_iteration > 0:
+    if converged(5, auc_list):
+        n_iteration -= 1
+        if n_iteration == 0:
+            break
+        C, deg_norm = prune_network(teX, teY, params2)
+        auc_list[:] = []
+    TIME, AUC, auc_list = tuning_network(1, C, teX, teY, params2, AUC, TIME)
 
-for i in range(20):
-    for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
-        cost = train(trX[start:end], trY[start:end])
-        for j in range(len(params2)):
-            repair(params2[j], C[j])
-    start = time.time()
-    y_score = predict(teX)
-    end = time.time()-start
-    auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
-    TIME.append(end)
-    AUC.append(auc_r)
-    print("AUC:", auc_r, "TIME:", end)
 
-data = pd.DataFrame({"AUC": AUC, "TIME": TIME})
-data.to_csv("cnnet_fusion_cifar_stacked2.csv", index=False)
+data = pd.DataFrame({"AUC": AUC, "TIME": TIME/reference_time, "DEG": deg_norm, "reference": reference_time})
+data.to_csv("cnnet_fusion_cifar_jointed_mp.csv", index=False)
