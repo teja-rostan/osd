@@ -5,10 +5,11 @@ import numpy as np
 from theano.tensor.nnet.conv import conv2d
 from theano.tensor.signal.downsample import max_pool_2d
 import load_mnist
-from ionmf.factorization.onmf import onmf
+# from ionmf.factorization.onmf import onmf
 import roc_auc as auc
-from timeit import default_timer as timer
+import time
 import pandas as pd
+import nimfa
 
 
 srng = RandomStreams()
@@ -39,13 +40,22 @@ def dropout(X, p=0.):
     return X
 
 
-def fusion_update(weight_matrix, rank):
+def fusion_update(weight_matrix, perc, not_first, c_old):
     weights = weight_matrix.get_value()
     (n_kernels, n_channels, w, h) = weights.shape
     C = np.zeros((n_kernels, n_channels, w, h))
     deg = 0
+    zero_kernels = 0
     for i in range(n_kernels):
-        weights, C, deg = prune(i, n_channels, weights, C, rank, deg)
+        if not_first:
+            weights, C, deg = prune(i, n_channels, weights, C, deg, perc, not_first, c_old)
+        else:
+            weights, C, deg = prune(i, n_channels, weights, C, deg, perc, not_first, 0)
+        for j in range(n_channels):
+            if np.count_nonzero(weights[i, j]) == 0:
+                zero_kernels += 1
+    print("Degree of zero kernels:", zero_kernels/(n_kernels*n_channels))
+    print("Degree of zero values:", deg/weights.size)
     weight_matrix.set_value(weights)
     return deg, C
 
@@ -55,25 +65,60 @@ def repair(weight_matrix, c):
     weights = weight_matrix.get_value()
     for i in range(n_kernels):
         for j in range(n_channels):
-            weights[i, j] *= c[i, j]
+            weights[i, j] = np.multiply(weights[i, j], c[i, j])
     weight_matrix.set_value(weights)
 
 
-def prune(i, n_channels, weights, C, rank, deg):
+def nmf(channels):
+    pos_matrix = channels.copy()
+    neg_matrix = channels.copy()
+
+    pos_matrix[pos_matrix < 0] = 0
+    neg_matrix = np.multiply(neg_matrix, -1)
+    neg_matrix[neg_matrix < 0] = 0
+
+    double_matrix = np.hstack([pos_matrix, neg_matrix])
+    rank = int(np.maximum(2, (len(channels)*0.5)))
+    model = nimfa.Nmf(double_matrix, max_iter=200, rank=rank, update='euclidean')
+    model_fit = model()
+    double_matrix = np.dot(model_fit.basis(), model_fit.coef())
+
+    pos, abs_neg = np.hsplit(double_matrix, 2)
+    neg = np.multiply(abs_neg, -1)
+    pos[pos_matrix == 0] = 1
+    neg[neg_matrix == 0] = 1
+    return np.multiply(pos, neg)
+
+
+def prune(i, n_channels, weights, C, deg, perc, not_first, old_c):
     for j in range(n_channels):
-        W, H = onmf(weights[i, j], rank=rank, alpha=1.0)
-        A = W.dot(H)
+        A = nmf(weights[i, j])
         diff = abs(A) - abs(weights[i, j])
-        threshold = np.mean(np.percentile(diff, 30))
-        c =  diff < threshold
-        weights[i, j] *= c
+        threshold = np.mean(np.percentile(diff, perc))
+        c = diff < threshold
+        if not_first:
+            c = np.multiply(c, old_c[i, j])
+        weights[i, j] = np.multiply(weights[i, j], c)
         C[i, j] = c
-        deg += (c.size - np.count_nonzero(c))
+        zeros = c.size - np.count_nonzero(c)
+        deg += zeros
     return weights, C, deg
 
 
-def degree(deg, params2):
+def degree_pruned(deg, params2):
     return deg / network_size(params2)
+
+
+def degree_zeros(params2):
+    return network_zeros(params2) / network_size(params2)
+
+
+def network_zeros(params2):
+    zeros = 0
+    for p in params2:
+        w = p.get_value()
+        zeros += np.count_nonzero(w)
+    return network_size(params2) - zeros
 
 
 def network_size(params2):
@@ -84,41 +129,43 @@ def network_size(params2):
     return size
 
 
-def learn_network(n_iterations, teX, teY, TIME, AUC, auc_list):
-    for i in range(n_iterations):
-        for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
-            train(trX[start:end], trY[start:end])
-        end, auc_r = predict_cnn(teX, teY)
-        TIME.append(end)
-        AUC.append(auc_r)
-        auc_list.append(auc_r)
-        print("AUC:", auc_r, "TIME:", end)
+def learn_network(teX, teY, TIME, AUC, auc_list):
+    for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
+        train(trX[start:end], trY[start:end])
+    end, auc_r = predict_cnn(teX, teY)
+    TIME.append(end)
+    AUC.append(auc_r)
+    auc_list.append(auc_r)
+    print("AUC:", auc_r, "TIME:", end)
     return TIME, AUC, auc_list
 
 
-def prune_network(teX, teY, params2):
+def prune_network(teX, teY, params2, perc, not_first, c_old):
     C = []
     deg = 0
-    for p in params2:
-        d, c = fusion_update(p, 5)
+    for i in range(len(params2)):
+        if not_first:
+            d, c = fusion_update(params2[i], perc, not_first, c_old[i])
+        else:
+            d, c = fusion_update(params2[i], perc, not_first, 0)
         C.append(c)
         deg += d
-    deg_norm = degree(deg, params2)
-    print("deg:", deg_norm)  # , "thresh:", np.mean(thresh)
+    deg_norm = degree_pruned(deg, params2)
+    print("deg:", deg_norm)
     return C, deg_norm
 
 
-def tuning_network(n_iterations, C, teX, teY, params2, AUC, TIME):
-    for i in range(n_iterations):
-        for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
-            train(trX[start:end], trY[start:end])
-            for j in range(len(params2)):
-                repair(params2[j], C[j])
-        end, auc_r = predict_cnn(teX, teY)
-        TIME.append(end)
-        AUC.append(auc_r)
-        auc_list.append(auc_r)
-        print("AUC:", auc_r, "TIME:", end)
+def tuning_network(C, teX, teY, params2, AUC, TIME):
+    for start, end in zip(range(0, len(trX), 128), range(128, len(trX), 128)):
+        train(trX[start:end], trY[start:end])
+    for j in range(len(params2)):
+        repair(params2[j], C[j])
+    end, auc_r = predict_cnn(teX, teY)
+    TIME.append(end)
+    AUC.append(auc_r)
+    auc_list.append(auc_r)
+    deg_norm = degree_zeros(params2)
+    print("AUC:", auc_r, "TIME:", end, "deg_zeros:", deg_norm)
     return TIME, AUC, auc_list
 
 
@@ -134,10 +181,10 @@ def converged(iteration, auc_list):
 
 def predict_cnn(teX, teY):
     _, _, h, w = teX.shape
-    start = timer()
+    start = time.process_time()
     y_score = predict(teX)
-    end = timer()
-    end = end - start
+    end = time.process_time()
+    end = end-start
     auc_r = auc.roc_auc(np.argmax(teY, axis=1), y_score)
     return end, auc_r
 
@@ -207,22 +254,39 @@ predict = theano.function(inputs=[X], outputs=y_x, allow_input_downcast=True)
 AUC = []
 auc_list = []
 TIME = []
-n_iteration = 4
+n_iteration = 5
+perc = 50
+DEG = []
+mf_iteration = []
+iteration = 0
 
 while not converged(5, auc_list):
-    TIME, AUC, auc_list = learn_network(1, teX, teY, TIME, AUC, auc_list)
-reference_time = np.max(TIME)
-C, deg_norm = prune_network(teX, teY, params2)
+    TIME, AUC, auc_list = learn_network(teX, teY, TIME, AUC, auc_list)
+    iteration += 1
+
+C, deg = prune_network(teX, teY, params2, perc, False, 0)
+mf_iteration.append(iteration)
+DEG.append(deg)
 auc_list[:] = []
+reference_time = np.max(TIME)
+
 while n_iteration > 0:
     if converged(5, auc_list):
         n_iteration -= 1
+        perc -= 10
         if n_iteration == 0:
             break
-        C, deg_norm = prune_network(teX, teY, params2)
+        C, deg = prune_network(teX, teY, params2, perc, True, C)
+
+        DEG.append(deg)
+        mf_iteration.append(iteration)
         auc_list[:] = []
-    TIME, AUC, auc_list = tuning_network(1, C, teX, teY, params2, AUC, TIME)
 
+    TIME, AUC, auc_list = tuning_network(C, teX, teY, params2, AUC, TIME)
+    iteration += 1
 
-data = pd.DataFrame({"AUC": AUC, "TIME": TIME/reference_time, "DEG": deg_norm, "reference": reference_time})
+for i in range(len(DEG), len(AUC)):
+    DEG.append(0)
+    mf_iteration.append(0)
+data = pd.DataFrame({"AUC": AUC, "TIME": TIME/reference_time, "DEG": DEG, "reference": reference_time, "MF_iter": mf_iteration})
 data.to_csv("cnnet_fusion_separated_mp.csv", index=False)
